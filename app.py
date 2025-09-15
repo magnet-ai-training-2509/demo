@@ -1,5 +1,7 @@
 import json
 import os
+import time
+from datetime import datetime
 import sqlite3
 from typing import Any, Dict, List
 
@@ -28,9 +30,34 @@ def get_schema(conn: sqlite3.Connection) -> str:
     return "\n".join(tables)
 
 
+def _log_query(*, query: str, rows_count: int, duration_ms: float | None, error: str | None) -> None:
+    """Append a JSON line to the queries log. Controlled via env:
+    - LOG_QUERIES: enable/disable (default on)
+    - LOG_FILE: path to log file (default queries.log)
+    """
+    enabled = os.environ.get("LOG_QUERIES", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return
+    event = {
+        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "sql": query,
+        "rows_count": rows_count,
+        "duration_ms": duration_ms,
+        "error": error,
+    }
+    try:
+        path = os.environ.get("LOG_FILE", "queries.log")
+        with open(path, "a", encoding="utf-8") as f:
+            json.dump(event, f, ensure_ascii=False)
+            f.write("\n")
+    except Exception:
+        # Never fail due to logging issues
+        pass
+
+
 def run_sql(conn: sqlite3.Connection, query: str, limit: int = 100) -> Dict[str, Any]:
     """Execute SQL while keeping the result JSON-serialisable for tool calls."""
-
+    started = time.perf_counter()
     try:
         limit_value = int(limit)
     except (TypeError, ValueError):  # pragma: no cover - defensive branch
@@ -45,7 +72,7 @@ def run_sql(conn: sqlite3.Connection, query: str, limit: int = 100) -> Dict[str,
             truncated = len(rows) > limit_value
             rows = rows[:limit_value]
             serialised_rows: List[List[Any]] = [list(row) for row in rows]
-            return {
+            result = {
                 "ok": True,
                 "type": "rows",
                 "columns": columns,
@@ -53,19 +80,24 @@ def run_sql(conn: sqlite3.Connection, query: str, limit: int = 100) -> Dict[str,
                 "row_count": len(serialised_rows),
                 "truncated": truncated,
             }
+            _log_query(query=query, rows_count=len(serialised_rows), duration_ms=round((time.perf_counter() - started) * 1000, 2), error=None)
+            return result
 
         if conn.in_transaction:
             conn.commit()
         affected = cursor.rowcount if cursor.rowcount != -1 else 0
-        return {
+        result = {
             "ok": True,
             "type": "status",
             "row_count": affected,
             "message": f"{affected} rows affected.",
         }
+        _log_query(query=query, rows_count=affected, duration_ms=round((time.perf_counter() - started) * 1000, 2), error=None)
+        return result
     except sqlite3.Error as exc:  # pragma: no cover - defensive branch
         if conn.in_transaction:
             conn.rollback()
+        _log_query(query=query, rows_count=0, duration_ms=round((time.perf_counter() - started) * 1000, 2), error=str(exc))
         return {"ok": False, "error": str(exc)}
     finally:
         cursor.close()

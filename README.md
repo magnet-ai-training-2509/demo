@@ -101,3 +101,19 @@ LIMIT 12;
 ```
 
 Ha inkább ismert mintaadatbázist szeretnél (pl. Chinook/Northwind), szólj, be tudom húzni és konvertálni SQLite-ra is.
+
+---
+
+## 📝 Lekérdezés-naplózás
+
+A futtatott SQL-ek JSON-lines formátumban naplózódnak (1 sor = 1 esemény).
+
+- Fájl: alapértelmezetten `queries.log`
+- Engedélyezés/tiltás: `LOG_QUERIES` (alap: `1`=engedélyezve)
+- Útvonal: `LOG_FILE` (alap: `queries.log`)
+
+Példa naplósor:
+
+```
+{"ts":"2025-09-15T16:12:34Z","sql":"SELECT * FROM customers LIMIT 10","rows_count":10,"duration_ms":2.41,"error":null}
+```
