@@ -38,9 +38,21 @@ Az OpenAI látja az adatbázis **sémáját**, a felhasználói igényeket és a
 
 ## 🚀 Hogyan próbálhatod ki?
 1. Konfiguráld az adatbázis-kapcsolatot (`.env` vagy config fájl).  
-2. Indítsd el az alkalmazást.  
-3. Írj be egy természetes nyelvű lekérdezést.  
-4. Nézd meg az eredményt az app felületén.
+2. Indítsd el az alkalmazást.
+3. Írj be egy természetes nyelvű lekérdezést.
+4. A beszélgetés addig folytatódik, amíg `exit` (vagy `kilép`) paranccsal ki nem lépsz.
+5. Nézd meg az eredményt az app felületén.
+
+### 💬 Chat üzemmód
+
+Az `app.py` mostantól folyamatos párbeszédet kezel:
+
+- az OpenAI-asszisztens három toolt használ: `get_schema`, `run_sql`, `finish`
+- a séma lekérése és az SQL futtatása is toolhívással történik
+- a felhasználó a `finish` tool hívása után kapja meg az összegzést
+- kilépéshez írd be: `exit`, `quit`, `kilép` vagy `kilep`
+
+Konfigurálható modell: `OPENAI_MODEL` (alapértelmezés: `gpt-4o-mini`).
 
 ---
 

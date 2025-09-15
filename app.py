@@ -1,11 +1,12 @@
+import json
 import os
 import sqlite3
-from typing import Any, List
+from typing import Any, Dict, List
 
 try:
-    import openai
+    from openai import OpenAI
 except ImportError:  # pragma: no cover - optional dependency
-    openai = None
+    OpenAI = None  # type: ignore[assignment]
 
 try:
     from dotenv import load_dotenv
@@ -27,29 +28,221 @@ def get_schema(conn: sqlite3.Connection) -> str:
     return "\n".join(tables)
 
 
-def generate_sql(question: str, schema: str) -> str:
-    """Use OpenAI to translate a natural language question into SQL."""
-    if openai is None:
+def run_sql(conn: sqlite3.Connection, query: str, limit: int = 100) -> Dict[str, Any]:
+    """Execute SQL while keeping the result JSON-serialisable for tool calls."""
+
+    try:
+        limit_value = int(limit)
+    except (TypeError, ValueError):  # pragma: no cover - defensive branch
+        limit_value = 100
+    limit_value = max(1, min(500, limit_value))
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query)
+        if cursor.description:
+            columns = [col[0] for col in cursor.description]
+            rows = cursor.fetchmany(limit_value + 1)
+            truncated = len(rows) > limit_value
+            rows = rows[:limit_value]
+            serialised_rows: List[List[Any]] = [list(row) for row in rows]
+            return {
+                "ok": True,
+                "type": "rows",
+                "columns": columns,
+                "rows": serialised_rows,
+                "row_count": len(serialised_rows),
+                "truncated": truncated,
+            }
+
+        if conn.in_transaction:
+            conn.commit()
+        affected = cursor.rowcount if cursor.rowcount != -1 else 0
+        return {
+            "ok": True,
+            "type": "status",
+            "row_count": affected,
+            "message": f"{affected} rows affected.",
+        }
+    except sqlite3.Error as exc:  # pragma: no cover - defensive branch
+        if conn.in_transaction:
+            conn.rollback()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        cursor.close()
+
+
+def ensure_openai_client() -> "OpenAI":
+    if OpenAI is None:  # pragma: no cover - optional dependency guard
         raise RuntimeError("openai package is not installed")
-    system = (
-        "You are an assistant that converts natural language questions to SQL "
-        "queries. Use only the provided schema and do not hallucinate." 
-    )
-    prompt = f"Schema:\n{schema}\nQuestion: {question}\nSQL:"
-    completion = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-    )
-    return completion.choices[0].message.content.strip()
+    return OpenAI()
 
 
-def run_query(conn: sqlite3.Connection, sql: str) -> List[tuple[Any]]:
-    cursor = conn.execute(sql)
-    return cursor.fetchall()
+def tool_definitions() -> List[Dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_schema",
+                "description": "Return the current SQL schema as text. Use before writing SQL or when structure may have changed.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_sql",
+                "description": "Execute a SQL statement against the connected SQLite database and get back the results.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The SQL statement to run. Must be valid SQLite syntax.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of rows to return (1-500).",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "default": 100,
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finish",
+                "description": "Send the final answer back to the user. Always call this when you are done reasoning and ready to respond.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "response": {
+                            "type": "string",
+                            "description": "Human-readable answer that will be shown to the user.",
+                        }
+                    },
+                    "required": ["response"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+
+
+def process_tool_call(
+    name: str,
+    arguments: Dict[str, Any],
+    conn: sqlite3.Connection,
+) -> Dict[str, Any]:
+    if name == "get_schema":
+        return {"schema": get_schema(conn)}
+    if name == "run_sql":
+        query = arguments.get("query")
+        if not isinstance(query, str):
+            return {"ok": False, "error": "Missing SQL query text."}
+        limit = arguments.get("limit", 100)
+        return run_sql(conn, query, limit)
+    if name == "finish":
+        return {"ack": True, "response": arguments.get("response", "")}
+    return {"ok": False, "error": f"Unknown tool: {name}"}
+
+
+def chat_loop(conn: sqlite3.Connection) -> None:
+    client = ensure_openai_client()
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    system_prompt = (
+        "You are a meticulous SQLite analyst. Use the available tools to inspect the schema and run SQL. "
+        "Always call the 'finish' tool with a clear, Hungarian user-facing answer when you are ready to respond."
+    )
+
+    history: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    tools = tool_definitions()
+
+    exit_words = {"exit", "quit", "kilep", "kilép", "q"}
+
+    while True:
+        try:
+            user_message = input("👤 Kérdés (exit a kilépéshez): ").strip()
+        except EOFError:  # pragma: no cover - CLI convenience
+            print()
+            break
+        except KeyboardInterrupt:  # pragma: no cover - CLI convenience
+            print("\nKilépés...")
+            break
+
+        if not user_message:
+            continue
+        if user_message.lower() in exit_words:
+            print("Kilépés...")
+            break
+
+        history.append({"role": "user", "content": user_message})
+
+        while True:
+            response = client.chat.completions.create(
+                model=model,
+                messages=history,
+                tools=tools,
+                temperature=0,
+            )
+            message = response.choices[0].message
+
+            assistant_entry: Dict[str, Any] = {"role": "assistant"}
+            if message.content:
+                assistant_entry["content"] = message.content
+            if message.tool_calls:
+                assistant_entry["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in message.tool_calls
+                ]
+            history.append(assistant_entry)
+
+            if not message.tool_calls:
+                content = (message.content or "").strip()
+                if content:
+                    print(f"🤖 {content}")
+                break
+
+            finish_called = False
+            for tool_call in message.tool_calls:
+                try:
+                    arguments = json.loads(tool_call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                    tool_result = {"ok": False, "error": "Invalid JSON arguments received."}
+                else:
+                    tool_result = process_tool_call(tool_call.function.name, arguments, conn)
+
+                history.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    }
+                )
+
+                if tool_call.function.name == "finish":
+                    finish_called = True
+                    response_text = tool_result.get("response", "").strip()
+                    if response_text:
+                        print(f"🤖 {response_text}")
+
+            if finish_called:
+                break
+
+
 
 
 def main() -> None:
@@ -59,15 +252,9 @@ def main() -> None:
         raise SystemExit("DATABASE_PATH environment variable not set")
 
     conn = sqlite3.connect(db_path)
-    schema = get_schema(conn)
 
     try:
-        question = input("Kérdés természetes nyelven: ")
-        sql = generate_sql(question, schema)
-        rows = run_query(conn, sql)
-        print("SQL:", sql)
-        for row in rows:
-            print(row)
+        chat_loop(conn)
     except Exception as exc:  # pragma: no cover - runtime errors
         print("Hiba:", exc)
     finally:
