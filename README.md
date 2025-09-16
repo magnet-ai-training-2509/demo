@@ -117,3 +117,21 @@ Példa naplósor:
 ```
 {"ts":"2025-09-15T16:12:34Z","sql":"SELECT * FROM customers LIMIT 10","rows_count":10,"duration_ms":2.41,"error":null}
 ```
+
+---
+
+## 🔌 MCP szerver ugyanazokkal a toolokkal
+
+Az `mcp_server.py` egy [Model Context Protocol](https://spec.modelcontextprotocol.io/) szervert indít, amely ugyanazt a két
+toolt (`get_schema`, `run_sql`) teszi elérhetővé, mint a CLI alkalmazás. Így a demóadatbázis távolról is integrálható MCP-
+kompatibilis kliensekbe.
+
+Használat:
+
+```bash
+pip install -r requirements.txt  # szükséges a `mcp` csomag is
+export DATABASE_PATH=sample.db   # vagy a saját SQLite fájlod
+python3 mcp_server.py
+```
+
+A szerver minden híváshoz új SQLite-kapcsolatot nyit, így több párhuzamos kérésre is biztonságosan reagál.
